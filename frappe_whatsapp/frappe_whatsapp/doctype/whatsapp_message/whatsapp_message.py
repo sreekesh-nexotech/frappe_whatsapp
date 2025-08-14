@@ -4,13 +4,47 @@ import json
 import frappe
 from frappe.model.document import Document
 from frappe.integrations.utils import make_post_request
-
+# whatsapp greyout code change start
+from frappe import _
+from frappe.utils import get_datetime, now_datetime
+# whatsapp greyout code change end
 
 class WhatsAppMessage(Document):
     """Send whats app messages."""
 
+    def within_24h_user_window(self, number: str):
+        """Return (allowed: bool, last_incoming: datetime|None, seconds_remaining: int|None)."""
+        formatted = self.format_number(number or "")
+        last = frappe.get_all(
+            "WhatsApp Message",
+            filters={"type": "Incoming", "from": formatted},
+            fields=["creation"],
+            order_by="creation desc",
+            limit=1,
+        )
+        if not last:
+            return False, None, None
+
+        last_dt = get_datetime(last[0].creation)
+        now_dt = now_datetime()
+        diff_sec = (now_dt - last_dt).total_seconds()
+        if diff_sec <= 24 * 60 * 60:
+            return True, last_dt, int(24 * 60 * 60 - diff_sec)
+        return False, last_dt, 0
+
     def before_insert(self):
         """Send message."""
+        if self.type == "Outgoing" and self.message_type != "Template":
+            allowed, last_dt, _ = self.within_24h_user_window(self.to)
+            if not allowed:
+                self.status = "Failed"
+                frappe.throw(
+                    _(
+                        "Cannot send free-form WhatsApp messages outside the 24-hour user-initiated window. "
+                        "Send an approved template instead."
+                    )
+                )
+
         if self.type == "Outgoing" and self.message_type != "Template":
             if self.attach and not self.attach.startswith("http"):
                 link = frappe.utils.get_url() + "/" + self.attach
@@ -174,3 +208,14 @@ def send_template(to, reference_doctype, reference_name, template):
         doc.save()
     except Exception as e:
         raise e
+
+@frappe.whitelist()
+def can_send_freeform(to: str):
+    """UI helper: can we send a manual (non-template) message to this number right now?"""
+    temp_doc = frappe.new_doc("WhatsApp Message")
+    allowed, last_dt, remaining = temp_doc.within_24h_user_window(to)
+    return {
+        "allowed": bool(allowed),
+        "last_incoming": frappe.utils.format_datetime(last_dt) if last_dt else None,
+        "seconds_remaining": remaining,
+    }
